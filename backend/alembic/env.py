@@ -6,6 +6,7 @@ from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from app.core.config import settings
+from app.core.database import _build_engine_args
 from app.core.database import Base
 
 # Import every module's models so Base.metadata knows about all tables —
@@ -33,7 +34,12 @@ from app.modules.webhooks.models import WebhookDelivery, WebhookSubscription  # 
 from app.modules.notifications.models import Notification  # noqa: F401
 
 config = context.config
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+
+# Same normalization the app uses, so migrations connect to a hosted
+# database (Neon, Supabase, Render) instead of failing on a `sslmode`
+# parameter that asyncpg doesn't recognise.
+_migration_url, _migration_connect_args = _build_engine_args(settings.DATABASE_URL)
+config.set_main_option("sqlalchemy.url", _migration_url)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
@@ -59,6 +65,7 @@ async def run_migrations_online() -> None:
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        connect_args=_migration_connect_args,
     )
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)
