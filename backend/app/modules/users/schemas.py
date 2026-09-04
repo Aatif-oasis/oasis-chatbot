@@ -20,6 +20,11 @@ class UserUpdateRequest(BaseModel):
     status: str | None = Field(default=None, pattern="^(active|invited|suspended)$")
 
 
+class PasswordResetRequest(BaseModel):
+    """An admin setting a new password for someone who is locked out."""
+    new_password: str = Field(min_length=8, max_length=128)
+
+
 class UserRoleAssignRequest(BaseModel):
     role: str = Field(pattern="^(org_admin|team_manager|agent)$")
 

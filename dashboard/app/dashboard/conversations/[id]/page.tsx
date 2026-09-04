@@ -12,8 +12,10 @@ import {
   getConversation,
   listAgents,
   sendAgentMessage,
+  transferConversation,
 } from "@/lib/api-client";
 import { useAgentSocket } from "@/lib/use-agent-socket";
+import { clockTime, dayLabel, fullTimestamp, isDifferentDay } from "@/lib/format-time";
 
 export default function ConversationDetailPage() {
   const params = useParams<{ id: string }>();
@@ -21,6 +23,10 @@ export default function ConversationDetailPage() {
 
   const [conversation, setConversation] = useState<ConversationDetail | null>(null);
   const [agentNames, setAgentNames] = useState<Record<string, string>>({});
+  const [agents, setAgents] = useState<AgentSummary[]>([]);
+  const [transferOpen, setTransferOpen] = useState(false);
+  const [transferTo, setTransferTo] = useState("");
+  const [transferring, setTransferring] = useState(false);
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
@@ -60,12 +66,16 @@ export default function ConversationDetailPage() {
       );
 
     listAgents()
-      .then((agents: AgentSummary[]) => {
+      .then((list: AgentSummary[]) => {
         const nameMap: Record<string, string> = {};
-        agents.forEach((a) => {
+        list.forEach((a) => {
           nameMap[a.id] = a.full_name;
         });
         setAgentNames(nameMap);
+        // Suspended accounts are filtered out here as well as rejected by
+        // the server — offering a name that will fail is worse than not
+        // offering it.
+        setAgents(list.filter((a) => a.status !== "suspended"));
       })
       .catch(() => undefined);
 
@@ -93,6 +103,22 @@ export default function ConversationDetailPage() {
       setError(err instanceof Error ? err.message : "That message didn't send. Try again.");
     } finally {
       setSending(false);
+    }
+  }
+
+  async function handleTransfer(agentId: string | null) {
+    if (!conversation) return;
+    setTransferring(true);
+    try {
+      const updated = await transferConversation(conversationId, agentId);
+      setConversation((prev) => (prev ? { ...prev, ...updated } : prev));
+      setTransferOpen(false);
+      setTransferTo("");
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not transfer this conversation");
+    } finally {
+      setTransferring(false);
     }
   }
 
@@ -164,9 +190,18 @@ export default function ConversationDetailPage() {
               {conversation.status}
             </span>
             <span>{assignedName ? `With ${assignedName}` : "Not yet claimed"}</span>
+            {conversation.messages.length > 0 && (
+              <span title={fullTimestamp(conversation.messages[0].created_at)}>
+                Started {dayLabel(conversation.messages[0].created_at).toLowerCase()} at{" "}
+                {clockTime(conversation.messages[0].created_at)}
+              </span>
+            )}
           </div>
         </div>
         <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+          <button className="btn btn-quiet" onClick={() => setTransferOpen((v) => !v)}>
+            Transfer
+          </button>
           <button className="btn btn-quiet" onClick={() => setTicketOpen((v) => !v)}>
             Raise a ticket
           </button>
@@ -177,6 +212,51 @@ export default function ConversationDetailPage() {
           )}
         </div>
       </div>
+
+      {transferOpen && (
+        <div className="ticket-form">
+          <div className="controls">
+            <label className="field" style={{ marginBottom: 0 }}>
+              Hand this chat to
+              <select value={transferTo} onChange={(e) => setTransferTo(e.target.value)}>
+                <option value="">Choose someone</option>
+                {agents
+                  .filter((a) => a.id !== conversation.assigned_agent_id)
+                  .map((a) => (
+                    <option key={a.id} value={a.id}>
+                      {a.full_name}
+                    </option>
+                  ))}
+              </select>
+            </label>
+
+            <button
+              className="btn"
+              disabled={!transferTo || transferring}
+              onClick={() => handleTransfer(transferTo)}
+            >
+              {transferring ? "Transferring" : "Transfer"}
+            </button>
+
+            {/* The other half of a transfer: letting go without picking a
+                person, so an agent going off shift can put the chat back
+                where anyone can claim it. */}
+            {conversation.assigned_agent_id && (
+              <button
+                className="btn btn-quiet"
+                disabled={transferring}
+                onClick={() => handleTransfer(null)}
+              >
+                Return to queue
+              </button>
+            )}
+
+            <button className="btn btn-quiet" onClick={() => setTransferOpen(false)}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
 
       {ticketDone && (
         <div className="alert alert-info" style={{ margin: "12px 24px 0" }}>
@@ -240,18 +320,34 @@ export default function ConversationDetailPage() {
       )}
 
       <div ref={listRef} className="thread">
-        {conversation.messages.map((m) => (
-          <div
-            key={m.id}
-            className={m.sender_type === "agent" ? "bubble-row bubble-row-agent" : "bubble-row"}
-          >
-            <div
-              className={m.sender_type === "agent" ? "bubble bubble-agent" : "bubble bubble-customer"}
-            >
-              {m.content}
+        {conversation.messages.map((m, index) => {
+          const previous = index > 0 ? conversation.messages[index - 1] : null;
+          // A date heading only when the day actually changes, so a chat
+          // that happened in one sitting isn't broken up by noise.
+          const showDay = !previous || isDifferentDay(previous.created_at, m.created_at);
+
+          return (
+            <div key={m.id}>
+              {showDay && <div className="day-divider">{dayLabel(m.created_at)}</div>}
+              <div
+                className={m.sender_type === "agent" ? "bubble-row bubble-row-agent" : "bubble-row"}
+              >
+                <div className="bubble-group">
+                  <div
+                    className={
+                      m.sender_type === "agent" ? "bubble bubble-agent" : "bubble bubble-customer"
+                    }
+                  >
+                    {m.content}
+                  </div>
+                  <div className="bubble-time" title={fullTimestamp(m.created_at)}>
+                    {clockTime(m.created_at)}
+                  </div>
+                </div>
+              </div>
             </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
 
       <div className="composer">

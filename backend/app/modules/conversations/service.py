@@ -17,6 +17,7 @@ from app.modules.conversations.repository import (
 from app.modules.conversations.schemas import ConversationUpdateRequest
 from app.modules.customers.models import Customer
 from app.modules.customers.repository import CustomerRepository
+from app.modules.users.repository import UserRepository
 from app.modules.automation.engine import collect_actions
 from app.modules.automation.repository import AutomationRuleRepository
 from app.modules.notifications.service import NotificationService
@@ -334,6 +335,18 @@ class ConversationService:
             raise ForbiddenError("You can only modify conversations assigned to you.")
 
         update_data = request.model_dump(exclude_unset=True)
+
+        # Transferring to someone who can't sign in would strand the
+        # conversation exactly the way a departing agent's open chats do:
+        # visible to everyone, openable by nobody. Check before, not after.
+        target_agent_id = update_data.get("assigned_agent_id")
+        if target_agent_id:
+            target = await UserRepository(self.session).get_by_id(target_agent_id)
+            if not target or target.organization_id != self.organization_id:
+                raise NotFoundError("That agent is not part of this workspace.")
+            if target.status == "suspended":
+                raise ForbiddenError("That account is suspended and cannot take conversations.")
+
         previous_assignee = conversation.assigned_agent_id
         for field, value in update_data.items():
             setattr(conversation, field, value)

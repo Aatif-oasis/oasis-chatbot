@@ -29,6 +29,7 @@ from app.modules.conversations.schemas import (
 )
 from app.modules.conversations.service import ConversationService
 from app.modules.customers.service import CustomerService
+from app.modules.users.repository import UserRepository
 from app.websockets.connection_manager import connection_manager
 
 public_router = APIRouter(prefix="/api/v1/public/{org_slug}/conversations", tags=["Public — Widget"])
@@ -359,6 +360,17 @@ async def agent_socket(websocket: WebSocket, token: str = Query(...)) -> None:
     except (JWTError, KeyError, ValueError, TypeError):
         await websocket.close(code=4401)
         return
+
+    # The REST endpoints re-check the account on every request, so a
+    # suspended agent loses access immediately there. A socket is opened
+    # once and then streams for as long as it stays open, so without this
+    # check someone who left the company could keep reading live customer
+    # messages until they closed the tab.
+    async with AsyncSessionLocal() as session:
+        account = await UserRepository(session).get_by_id(user_id)
+        if not account or account.status == "suspended":
+            await websocket.close(code=4401)
+            return
 
     await websocket.accept()
     connection_manager.join_org_agents(organization_id, websocket)

@@ -147,6 +147,21 @@ export function sendAgentMessage(id: string, content: string): Promise<Message> 
   });
 }
 
+/**
+ * Hand a conversation to another agent, or return it to the shared queue
+ * by passing null. Same endpoint as closing — the backend notifies the new
+ * assignee and pushes the change to every open dashboard.
+ */
+export function transferConversation(
+  id: string,
+  agentId: string | null
+): Promise<ConversationSummary> {
+  return request<ConversationSummary>(`/api/v1/conversations/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ assigned_agent_id: agentId }),
+  });
+}
+
 export function closeConversation(id: string): Promise<ConversationSummary> {
   return request<ConversationSummary>(`/api/v1/conversations/${id}`, {
     method: "PATCH",
@@ -206,6 +221,21 @@ export function getCurrentUser(): CurrentUser | null {
   } catch {
     return null;
   }
+}
+
+export function resetUserPassword(userId: string, newPassword: string): Promise<UserSummary> {
+  return request<UserSummary>(`/api/v1/users/${userId}/reset-password`, {
+    method: "POST",
+    body: JSON.stringify({ new_password: newPassword }),
+  });
+}
+
+export function suspendUser(userId: string): Promise<void> {
+  return request<void>(`/api/v1/users/${userId}`, { method: "DELETE" });
+}
+
+export function reactivateUser(userId: string): Promise<UserSummary> {
+  return request<UserSummary>(`/api/v1/users/${userId}/reactivate`, { method: "POST" });
 }
 
 export function inviteUser(

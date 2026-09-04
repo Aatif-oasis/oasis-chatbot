@@ -62,6 +62,36 @@ class UserService:
         await self.session.commit()
         return user, roles
 
+    async def reset_password(
+        self, actor_user_id: uuid.UUID, user_id: uuid.UUID, new_password: str
+    ) -> User:
+        """
+        The answer to "an agent forgot their password". Nobody, including
+        an admin, can read the old one — only a hash is stored — so the
+        only possible help is to set a new one and tell them what it is.
+
+        The account is moved back to 'invited', which is the same state a
+        brand new user is in: it is a plain record that this password came
+        from an admin, not from the person who owns the account.
+        """
+        user, _ = await self.get_user(user_id)
+        user.password_hash = hash_password(new_password)
+        user.status = "invited"
+        await self.repo.update(user)
+        await self.audit_service.log(
+            actor_user_id, "user.password_reset", "user", user_id, {"email": user.email}
+        )
+        await self.session.commit()
+        return user
+
+    async def reactivate_user(self, actor_user_id: uuid.UUID, user_id: uuid.UUID) -> User:
+        user, _ = await self.get_user(user_id)
+        user.status = "active"
+        await self.repo.update(user)
+        await self.audit_service.log(actor_user_id, "user.reactivated", "user", user_id, {})
+        await self.session.commit()
+        return user
+
     async def deactivate_user(self, actor_user_id: uuid.UUID, user_id: uuid.UUID) -> None:
         user, _ = await self.get_user(user_id)
         user.status = "suspended"

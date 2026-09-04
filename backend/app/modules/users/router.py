@@ -9,6 +9,7 @@ from app.modules.auth.dependencies import CurrentUser, require_roles
 from app.modules.users.repository import UserRepository
 from app.modules.users.schemas import (
     UserInviteRequest,
+    PasswordResetRequest,
     UserResponse,
     UserRoleAssignRequest,
     UserUpdateRequest,
@@ -110,6 +111,37 @@ async def deactivate_user(
 ) -> None:
     """Soft deactivate — sets status to 'suspended' rather than deleting the row."""
     await UserService(db, current_user.organization_id).deactivate_user(current_user.id, user_id)
+
+
+@router.post("/{user_id}/reset-password", response_model=UserResponse)
+async def reset_password(
+    user_id: uuid.UUID,
+    request: PasswordResetRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(require_roles("org_admin")),
+) -> UserResponse:
+    """
+    Admin-only: sets a new password for a locked-out user. Deliberately
+    not available to team managers — being able to set someone's password
+    is being able to sign in as them.
+    """
+    service = UserService(db, current_user.organization_id)
+    await service.reset_password(current_user.id, user_id, request.new_password)
+    user, roles = await service.get_user(user_id)
+    return UserResponse(**user.__dict__, roles=roles)
+
+
+@router.post("/{user_id}/reactivate", response_model=UserResponse)
+async def reactivate_user(
+    user_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(require_roles("org_admin")),
+) -> UserResponse:
+    """Undo a suspension — for someone returning, or suspended by mistake."""
+    service = UserService(db, current_user.organization_id)
+    await service.reactivate_user(current_user.id, user_id)
+    user, roles = await service.get_user(user_id)
+    return UserResponse(**user.__dict__, roles=roles)
 
 
 @router.post("/{user_id}/roles", response_model=UserResponse)

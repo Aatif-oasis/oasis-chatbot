@@ -11,6 +11,7 @@ import {
   listAgents,
   updateTicket,
 } from "@/lib/api-client";
+import { fullTimestamp } from "@/lib/format-time";
 
 const STATUSES = ["open", "pending", "resolved", "closed"];
 const PRIORITIES = ["low", "medium", "high", "urgent"];
@@ -169,8 +170,7 @@ export default function TicketDetailPage() {
           ticket.comments.map((c) => (
             <div key={c.id} className="note">
               <div className="note-head">
-                {agentNames[c.author_user_id] || "An agent"} ·{" "}
-                {new Date(c.created_at).toLocaleString()}
+                {agentNames[c.author_user_id] || "An agent"}, {fullTimestamp(c.created_at)}
               </div>
               <div>{c.text}</div>
             </div>

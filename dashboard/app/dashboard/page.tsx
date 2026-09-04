@@ -9,8 +9,10 @@ import {
   getCurrentUser,
   listAgents,
   listConversations,
+  transferConversation,
 } from "@/lib/api-client";
 import { useAgentSocket } from "@/lib/use-agent-socket";
+import { fullTimestamp, relativeTime } from "@/lib/format-time";
 
 export default function ConversationsPage() {
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
@@ -19,6 +21,25 @@ export default function ConversationsPage() {
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [me, setMe] = useState<CurrentUser | null>(null);
+  const [suspendedAgents, setSuspendedAgents] = useState<Set<string>>(new Set());
+  const [claiming, setClaiming] = useState<string | null>(null);
+
+  // A chat left behind by someone who has been suspended belongs to nobody
+  // in practice: it shows as assigned, so no agent can open it, and the
+  // customer waits. Supervisors get a one-click way to pull it back.
+  async function claimStranded(conversationId: string) {
+    if (!me) return;
+    setClaiming(conversationId);
+    try {
+      await transferConversation(conversationId, me.id);
+      await refresh();
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not take this conversation");
+    } finally {
+      setClaiming(null);
+    }
+  }
 
   // Plain agents see the whole board but may only open their own chats and
   // unclaimed ones. Supervisors can open anything.
@@ -43,10 +64,13 @@ export default function ConversationsPage() {
     try {
       const agents = await listAgents();
       const nameMap: Record<string, string> = {};
+      const suspended = new Set<string>();
       agents.forEach((a: AgentSummary) => {
         nameMap[a.id] = a.full_name;
+        if (a.status === "suspended") suspended.add(a.id);
       });
       setAgentNames(nameMap);
+      setSuspendedAgents(suspended);
     } catch {
       // Leave whatever names we already had.
     }
@@ -55,6 +79,14 @@ export default function ConversationsPage() {
   useEffect(() => {
     setMe(getCurrentUser());
     refresh().finally(() => setLoading(false));
+  }, []);
+
+  // "4 min ago" is only true for a minute. Without this the timestamps on
+  // a screen left open all afternoon would quietly become lies.
+  const [, forceTick] = useState(0);
+  useEffect(() => {
+    const timer = setInterval(() => forceTick((n) => n + 1), 60_000);
+    return () => clearInterval(timer);
   }, []);
 
   useAgentSocket((event) => {
@@ -113,9 +145,16 @@ export default function ConversationsPage() {
 
             const body = (
               <div className="row-body">
-                <div className="row-name">
-                  {c.customer_name || "Unnamed visitor"}
-                  {c.customer_phone && <span className="row-phone">{c.customer_phone}</span>}
+                <div className="row-top">
+                  <div className="row-name">
+                    {c.customer_name || "Unnamed visitor"}
+                    {c.customer_phone && <span className="row-phone">{c.customer_phone}</span>}
+                  </div>
+                  {c.last_message_at && (
+                    <span className="row-time" title={fullTimestamp(c.last_message_at)}>
+                      {relativeTime(c.last_message_at)}
+                    </span>
+                  )}
                 </div>
                 <div className="row-meta">
                   {c.assigned_agent_id ? (
@@ -129,6 +168,9 @@ export default function ConversationsPage() {
                     <span className="pill pill-waiting">Waiting for an agent</span>
                   )}
                   {!openable && <span>Locked — another agent is handling this</span>}
+                  {c.assigned_agent_id && suspendedAgents.has(c.assigned_agent_id) && (
+                    <span className="pill pill-urgent">Agent no longer active</span>
+                  )}
                 </div>
               </div>
             );
@@ -136,6 +178,28 @@ export default function ConversationsPage() {
             // Rows an agent can't open are still listed, so the board answers
             // "is this customer already being helped?" without sending anyone
             // to a permissions error to find out.
+            const stranded =
+              !!c.assigned_agent_id && suspendedAgents.has(c.assigned_agent_id);
+            const canClaim =
+              stranded &&
+              !!me?.roles.some((r) => r === "org_admin" || r === "team_manager");
+
+            if (canClaim) {
+              return (
+                <div key={c.id} className={`${rowClass} row-open`}>
+                  {body}
+                  <button
+                    className="btn btn-quiet"
+                    style={{ flexShrink: 0, alignSelf: "center" }}
+                    disabled={claiming === c.id}
+                    onClick={() => claimStranded(c.id)}
+                  >
+                    {claiming === c.id ? "Taking" : "Take over"}
+                  </button>
+                </div>
+              );
+            }
+
             return openable ? (
               <Link key={c.id} href={`/dashboard/conversations/${c.id}`} className={rowClass}>
                 {body}
