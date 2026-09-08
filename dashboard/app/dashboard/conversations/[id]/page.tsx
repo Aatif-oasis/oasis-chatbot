@@ -11,6 +11,7 @@ import {
   createTicket,
   getConversation,
   listAgents,
+  markConversationRead,
   sendAgentMessage,
   transferConversation,
 } from "@/lib/api-client";
@@ -27,6 +28,7 @@ export default function ConversationDetailPage() {
   const [transferOpen, setTransferOpen] = useState(false);
   const [transferTo, setTransferTo] = useState("");
   const [transferring, setTransferring] = useState(false);
+  const [customerReadAt, setCustomerReadAt] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
@@ -53,14 +55,33 @@ export default function ConversationDetailPage() {
       if (!incoming.id) return;
       setConversation((prev) => (prev ? addMessageIfNew(prev, incoming) : prev));
     }
+    if (
+      event.type === "read_receipt" &&
+      event.conversation_id === conversationId &&
+      event.by === "customer"
+    ) {
+      setCustomerReadAt(typeof event.at === "string" ? event.at : null);
+    }
     if (event.type === "conversation_transferred" && event.conversation_id === conversationId) {
       getConversation(conversationId).then(setConversation).catch(() => undefined);
     }
   });
 
+  // Opening the chat is what "reading" means here, so tell the server as
+  // soon as the page mounts and again whenever a new message arrives
+  // while the agent is still looking at it.
+  useEffect(() => {
+    if (!conversation) return;
+    markConversationRead(conversationId).catch(() => undefined);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [conversationId, conversation?.messages.length]);
+
   useEffect(() => {
     getConversation(conversationId)
-      .then(setConversation)
+      .then((data) => {
+        setConversation(data);
+        setCustomerReadAt(data.customer_last_read_at);
+      })
       .catch((err) =>
         setError(err instanceof Error ? err.message : "Could not load this conversation")
       );
@@ -320,8 +341,18 @@ export default function ConversationDetailPage() {
       )}
 
       <div ref={listRef} className="thread">
+        {/* Only the last outgoing message carries the receipt. Marking
+            every one "Seen" is noise: the thread is read top to bottom, so
+            the last one tells you about all of them. */}
         {conversation.messages.map((m, index) => {
           const previous = index > 0 ? conversation.messages[index - 1] : null;
+          const isLastAgentMessage =
+            m.sender_type === "agent" &&
+            !conversation.messages.slice(index + 1).some((later) => later.sender_type === "agent");
+          const seen =
+            isLastAgentMessage &&
+            !!customerReadAt &&
+            new Date(customerReadAt).getTime() >= new Date(m.created_at).getTime();
           // A date heading only when the day actually changes, so a chat
           // that happened in one sitting isn't broken up by noise.
           const showDay = !previous || isDifferentDay(previous.created_at, m.created_at);
@@ -342,6 +373,11 @@ export default function ConversationDetailPage() {
                   </div>
                   <div className="bubble-time" title={fullTimestamp(m.created_at)}>
                     {clockTime(m.created_at)}
+                    {isLastAgentMessage && (
+                      <span className={seen ? "receipt receipt-seen" : "receipt"}>
+                        {seen ? "Seen" : "Sent"}
+                      </span>
+                    )}
                   </div>
                 </div>
               </div>

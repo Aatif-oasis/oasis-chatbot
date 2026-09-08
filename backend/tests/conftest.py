@@ -66,11 +66,21 @@ async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
     # test function its own event loop, so reusing the singleton across
     # tests throws "Future attached to a different loop". Creating one here
     # ties it to the current test's loop instead.
-    from redis.asyncio import from_url
-
     from app.core.config import settings
 
-    test_redis = from_url(settings.REDIS_URL, decode_responses=True)
+    try:
+        # Prefer a real Redis when one is running, since that is what the
+        # app talks to in production. Fall back to an in-process fake so
+        # the suite still runs on a machine (or CI box) without Redis —
+        # the alternative is every conversation test failing for a reason
+        # that has nothing to do with the code under test.
+        import fakeredis.aioredis
+
+        test_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    except ImportError:
+        from redis.asyncio import from_url
+
+        test_redis = from_url(settings.REDIS_URL, decode_responses=True)
 
     async def override_get_redis():
         return test_redis

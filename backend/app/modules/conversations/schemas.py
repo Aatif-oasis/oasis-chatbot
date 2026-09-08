@@ -56,6 +56,10 @@ class ConversationResponse(BaseModel):
     started_at: datetime
     closed_at: datetime | None
     last_message_at: datetime | None
+    # Read receipts: when each side last had the chat open. A message is
+    # "seen" if the other side's timestamp is later than it.
+    customer_last_read_at: datetime | None = None
+    agent_last_read_at: datetime | None = None
 
     # Denormalized customer identity. The widget's pre-chat form collects
     # name + phone, but until now an agent (or a CRM reading this API) only
@@ -84,6 +88,9 @@ class PublicConversationHistoryResponse(BaseModel):
     id: uuid.UUID
     status: str
     messages: list[MessageResponse]
+    # Only the agent's timestamp is sent to the widget: the visitor needs
+    # to know whether an agent has read their message, and nothing more.
+    agent_last_read_at: datetime | None = None
 
 
 # ---------- Agent-facing ----------

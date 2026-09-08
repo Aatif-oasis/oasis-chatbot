@@ -75,6 +75,21 @@ async def start_conversation(
     )
 
 
+@public_router.post("/{conversation_id}/read", status_code=status.HTTP_204_NO_CONTENT)
+async def mark_read_by_customer(
+    org_slug: str,
+    conversation_id: uuid.UUID,
+    external_id: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
+) -> None:
+    """The visitor has the chat panel open, so the agent's replies are seen."""
+    organization_id = await CustomerService.resolve_organization_id(db, org_slug)
+    await ConversationService(db, organization_id).mark_read_by_customer(
+        redis, conversation_id, external_id
+    )
+
+
 @public_router.get("/{conversation_id}", response_model=PublicConversationHistoryResponse)
 async def get_conversation_history(
     org_slug: str,
@@ -96,6 +111,7 @@ async def get_conversation_history(
         id=conversation.id,
         status=conversation.status,
         messages=[MessageResponse.model_validate(m) for m in messages],
+        agent_last_read_at=conversation.agent_last_read_at,
     )
 
 
@@ -225,6 +241,19 @@ async def send_agent_message(
         redis, conversation_id, current_user.id, request.content, current_user.roles
     )
     return MessageResponse.model_validate(message)
+
+
+@router.post("/{conversation_id}/read", status_code=status.HTTP_204_NO_CONTENT)
+async def mark_read_by_agent(
+    conversation_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
+    current_user: CurrentUser = Depends(require_roles("org_admin", "team_manager", "agent")),
+) -> None:
+    """The agent is looking at the chat, so the customer's messages are seen."""
+    await ConversationService(db, current_user.organization_id).mark_read_by_agent(
+        redis, conversation_id, current_user.id, current_user.roles
+    )
 
 
 @router.patch("/{conversation_id}", response_model=ConversationResponse)

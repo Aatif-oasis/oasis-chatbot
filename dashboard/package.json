@@ -5,7 +5,9 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "predev": "node scripts/copy-widget.js",
+    "prebuild": "node scripts/copy-widget.js"
   },
   "dependencies": {
     "next": "16.3.0",

@@ -117,6 +117,8 @@ export interface ConversationSummary {
   customer_name: string | null;
   customer_phone: string | null;
   customer_email: string | null;
+  customer_last_read_at: string | null;
+  agent_last_read_at: string | null;
 }
 
 export interface Message {
@@ -160,6 +162,14 @@ export function transferConversation(
     method: "PATCH",
     body: JSON.stringify({ assigned_agent_id: agentId }),
   });
+}
+
+/**
+ * Tells the server the agent is looking at this chat, which turns the
+ * customer's "sent" into "seen" on their side within a second.
+ */
+export function markConversationRead(id: string): Promise<void> {
+  return request<void>(`/api/v1/conversations/${id}/read`, { method: "POST" });
 }
 
 export function closeConversation(id: string): Promise<ConversationSummary> {

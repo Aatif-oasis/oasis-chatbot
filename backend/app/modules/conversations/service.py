@@ -299,6 +299,65 @@ class ConversationService:
             redis, conversation, sender_type="agent", sender_id=agent_user_id, content=content
         )
 
+    # ---------- Read receipts ----------
+
+    async def mark_read_by_agent(
+        self,
+        redis: Redis,
+        conversation_id: uuid.UUID,
+        agent_user_id: uuid.UUID,
+        current_user_roles: list[str] | None = None,
+    ) -> Conversation:
+        """
+        The agent has the chat open, so everything in it has been seen.
+        The customer's widget is told over the socket, which is the whole
+        point: a visitor who can see their message was read stops
+        wondering whether it arrived at all.
+        """
+        conversation = await self._get_conversation_or_404(conversation_id)
+        self.assert_can_access(conversation, agent_user_id, current_user_roles)
+
+        conversation.agent_last_read_at = datetime.now(timezone.utc)
+        await self.conversation_repo.update(conversation)
+        await self.session.commit()
+
+        await publish_to_conversation(
+            redis,
+            conversation.id,
+            {
+                "type": "read_receipt",
+                "conversation_id": str(conversation.id),
+                "by": "agent",
+                "at": conversation.agent_last_read_at.isoformat(),
+            },
+        )
+        return conversation
+
+    async def mark_read_by_customer(
+        self, redis: Redis, conversation_id: uuid.UUID, external_id: str
+    ) -> Conversation:
+        """Same, from the visitor's side. Ownership re-checked, as always."""
+        conversation = await self._get_conversation_or_404(conversation_id)
+        customer = await self.customer_repo.get_by_external_id(self.organization_id, external_id)
+        if not customer or customer.id != conversation.customer_id:
+            raise ForbiddenError("This conversation does not belong to that visitor.")
+
+        conversation.customer_last_read_at = datetime.now(timezone.utc)
+        await self.conversation_repo.update(conversation)
+        await self.session.commit()
+
+        payload = {
+            "type": "read_receipt",
+            "conversation_id": str(conversation.id),
+            "by": "customer",
+            "at": conversation.customer_last_read_at.isoformat(),
+        }
+        # Agents watch two channels: the conversation itself when they have
+        # it open, and the org-wide one for their inbox. Both get it.
+        await publish_to_conversation(redis, conversation.id, payload)
+        await publish_to_org_agents(redis, self.organization_id, payload)
+        return conversation
+
     async def add_integration_message(
         self,
         redis: Redis,

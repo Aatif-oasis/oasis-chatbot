@@ -760,3 +760,18 @@ a {
 .bubble-row-agent .bubble-group {
   align-items: flex-end;
 }
+
+/* ---------- Read receipts ---------- */
+
+/* Sits beside the timestamp, quieter than it: useful when looked for,
+   invisible when not. */
+.receipt {
+  margin-left: 7px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.receipt-seen {
+  color: var(--accent);
+  font-weight: 500;
+}

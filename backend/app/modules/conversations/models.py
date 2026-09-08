@@ -38,6 +38,18 @@ class Conversation(Base, AuditMixin):
         DateTime(timezone=True), nullable=True
     )
 
+    # Read receipts. Stored as one "last seen" timestamp per side rather
+    # than a read flag on every message: a chat is read top to bottom, so
+    # one timestamp answers "has this been seen?" for every message at
+    # once, and marking read stays a single row update no matter how long
+    # the conversation is.
+    customer_last_read_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    agent_last_read_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
 
 class Tag(Base, AuditMixin):
     """Org-scoped, reusable across conversations. name unique per org."""

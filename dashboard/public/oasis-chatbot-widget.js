@@ -4,7 +4,15 @@
  * Usage on any website:
  *   <script src="https://cdn.example.com/oasis-chatbot-widget.js"
  *           data-org-slug="acme-corp"
- *           data-api-base="https://api.oasis_chatbot.example.com"></script>
+ *           data-api-base="https://api.example.com"
+ *           data-title="Welcome!"
+ *           data-subtitle="Text us"
+ *           data-agent-name="Priya Sharma"
+ *           data-agent-avatar="https://.../priya.jpg"
+ *           data-topics="Track my order,Refund status,Talk to a human"></script>
+ *
+ * Only data-org-slug and data-api-base are required; everything else has
+ * a sensible default.
  *
  * Deliberately vanilla JS, not React/Vue: this has to run correctly on
  * whatever framework (or no framework) the HOST site uses, so it can't
@@ -25,6 +33,37 @@
     return;
   }
 
+  // ---------- Branding, all optional ----------
+  var TITLE = scriptTag.getAttribute("data-title") || "Hello there!";
+  var SUBTITLE = scriptTag.getAttribute("data-subtitle") || "How can we help?";
+  var AGENT_NAME = scriptTag.getAttribute("data-agent-name") || "Support team";
+  var AGENT_AVATAR = scriptTag.getAttribute("data-agent-avatar") || "";
+  var GREETING =
+    scriptTag.getAttribute("data-greeting") ||
+    "Hi! Ask us anything, or pick a topic to get started.";
+  // Launcher behaviour. The teaser is the single biggest thing that turns
+  // a widget nobody notices into one people click, so it is on by default
+  // — but it appears once per browser session and can be dismissed, which
+  // is the line between inviting and nagging.
+  var LAUNCHER_TEXT = scriptTag.getAttribute("data-launcher-text") || "";
+  var TEASER_TEXT =
+    scriptTag.getAttribute("data-teaser") || "Hi there! Need any help?";
+  var TEASER_DELAY = parseInt(scriptTag.getAttribute("data-teaser-delay") || "6", 10) * 1000;
+  var TEASER_OFF = scriptTag.getAttribute("data-teaser") === "off";
+
+  var TOPICS = (scriptTag.getAttribute("data-topics") || "")
+    .split(",")
+    .map(function (t) { return t.trim(); })
+    .filter(Boolean);
+
+  // Theme colours, overridable per site.
+  var BRAND = scriptTag.getAttribute("data-color") || "#0e7c66";
+  var BRAND_DARK = scriptTag.getAttribute("data-color-dark") || "#0b2b27";
+  var INK = "#10201e";
+  var MUTED = "#5d716d";
+  var LINE = "#dce5e2";
+  var CANVAS = "#f4f8f6";
+
   // ---------- Visitor identity (NOT a login — just a stable per-browser id) ----------
 
   function getOrCreateExternalId() {
@@ -41,6 +80,12 @@
   var historyLoaded = false;
   var reconnectAttempts = 0;
   var reconnectTimer = null;
+  var unreadCount = 0;
+  var pendingTopic = null;
+  // When an agent last had this chat open. Anything the visitor sent
+  // before this moment has been read.
+  var agentReadAt = null;
+  var lastOutgoingRow = null;
 
   // ---------- Conversation continuity across page loads ----------
   // Without this, a page refresh dropped the thread: the visitor saw an
@@ -88,8 +133,7 @@
 
   // ---------- Country dialling codes ----------
   // Bundled rather than fetched: the widget must work on any website with
-  // no extra network calls and no build step. Ordered by how commonly the
-  // code is needed, then alphabetically, so the list is quick to scan.
+  // no extra network calls and no build step.
   var COUNTRIES = [
     { iso: "IN", name: "India", dial: "91" },
     { iso: "US", name: "United States", dial: "1" },
@@ -145,11 +189,16 @@
     "America/Los_Angeles": "US", "America/Toronto": "CA", "Australia/Sydney": "AU"
   };
 
+  function findCountry(iso) {
+    for (var i = 0; i < COUNTRIES.length; i++) {
+      if (COUNTRIES[i].iso === iso) return COUNTRIES[i];
+    }
+    return null;
+  }
+
   /**
    * Best guess at the visitor's country, so most people never touch the
-   * dropdown. Locale region first (a UK visitor with a US browser locale
-   * is rarer than the reverse), then timezone, then India as the default
-   * for this deployment.
+   * dropdown: saved choice, then locale region, then timezone.
    */
   function detectCountry() {
     var saved = window.localStorage.getItem(COUNTRY_STORAGE_KEY);
@@ -168,13 +217,6 @@
     } catch (e) { /* fall through */ }
 
     return "IN";
-  }
-
-  function findCountry(iso) {
-    for (var i = 0; i < COUNTRIES.length; i++) {
-      if (COUNTRIES[i].iso === iso) return COUNTRIES[i];
-    }
-    return null;
   }
 
   // ---------- API calls ----------
@@ -231,6 +273,18 @@
     });
   }
 
+  /**
+   * Tells the server the visitor is looking at the chat. Fire-and-forget:
+   * a receipt that fails to register is not worth an error message.
+   */
+  function markRead() {
+    if (!conversationId) return;
+    fetch(
+      apiUrl("/conversations/" + conversationId + "/read?external_id=" + encodeURIComponent(externalId)),
+      { method: "POST" }
+    ).catch(function () {});
+  }
+
   function loadHistory() {
     if (!conversationId || historyLoaded) return Promise.resolve();
     return fetch(
@@ -250,15 +304,21 @@
       .then(function (data) {
         if (!data) return;
         historyLoaded = true;
+        agentReadAt = data.agent_last_read_at || null;
         messageList.innerHTML = "";
+        introRendered = false;
+        lastOutgoingRow = null;
+        renderIntro();
         data.messages.forEach(function (m) {
-          renderMessage(m.sender_type, m.content);
+          renderMessage(m.sender_type, m.content, m.created_at);
         });
+        paintReceipt();
         if (data.status === "closed") {
-          renderNotice("This conversation was closed. Sending a message will start a new one.");
+          renderNotice("This chat was closed. Send a message to start a new one.");
           clearConversationId();
         } else {
           connectSocket();
+          markRead();
         }
       })
       .catch(function () {
@@ -273,13 +333,8 @@
     }
     var wsBase = API_BASE.replace(/^http/, "ws");
     var url =
-      wsBase +
-      "/api/v1/public/" +
-      ORG_SLUG +
-      "/conversations/" +
-      conversationId +
-      "/ws?external_id=" +
-      encodeURIComponent(externalId);
+      wsBase + "/api/v1/public/" + ORG_SLUG + "/conversations/" + conversationId +
+      "/ws?external_id=" + encodeURIComponent(externalId);
 
     socket = new WebSocket(url);
 
@@ -294,8 +349,21 @@
       } catch (e) {
         return;
       }
+      if (payload.type === "read_receipt" && payload.by === "agent") {
+        agentReadAt = payload.at || null;
+        paintReceipt();
+        return;
+      }
       if (payload.type === "new_message" && payload.message.sender_type !== "customer") {
-        renderMessage(payload.message.sender_type, payload.message.content);
+        renderMessage(payload.message.sender_type, payload.message.content, payload.message.created_at);
+        // The visitor is looking at the panel, so the reply is read now.
+        if (panel.style.display === "flex" && chatScreen.style.display === "flex") markRead();
+        // A reply that arrives while the panel is shut should be visible
+        // from the launcher, or the visitor never learns it came.
+        if (panel.style.display !== "flex") {
+          unreadCount += 1;
+          paintBadge();
+        }
       }
     };
 
@@ -311,136 +379,329 @@
     };
   }
 
+  // ---------- Small helpers ----------
+
+  function el(tag, css, text) {
+    var node = document.createElement(tag);
+    if (css) node.style.cssText = css;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function clockTime(iso) {
+    var d = iso ? new Date(iso) : new Date();
+    if (isNaN(d.getTime())) d = new Date();
+    return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  }
+
+  function initials(name) {
+    return (name || "?")
+      .split(/\s+/)
+      .slice(0, 2)
+      .map(function (w) { return w.charAt(0).toUpperCase(); })
+      .join("");
+  }
+
+  /** Avatar with the little green "we're here" dot, used in three places. */
+  function avatar(size) {
+    var wrap = el("div", "position:relative;width:" + size + "px;height:" + size + "px;flex-shrink:0;");
+    var face;
+    if (AGENT_AVATAR) {
+      face = el("img", "width:100%;height:100%;border-radius:50%;object-fit:cover;display:block;");
+      face.src = AGENT_AVATAR;
+      face.alt = AGENT_NAME;
+    } else {
+      face = el(
+        "div",
+        "width:100%;height:100%;border-radius:50%;background:" + BRAND_DARK +
+          ";color:#fff;display:flex;align-items:center;justify-content:center;" +
+          "font-size:" + Math.round(size * 0.38) + "px;font-weight:600;",
+        initials(AGENT_NAME)
+      );
+    }
+    wrap.appendChild(face);
+
+    var dotSize = Math.max(9, Math.round(size * 0.26));
+    wrap.appendChild(
+      el(
+        "span",
+        "position:absolute;right:-1px;bottom:-1px;width:" + dotSize + "px;height:" + dotSize +
+          "px;border-radius:50%;background:#22c55e;border:2px solid #fff;box-sizing:border-box;"
+      )
+    );
+    return wrap;
+  }
+
   // ---------- UI ----------
 
-  var panel, messageList, input, preChatForm, chatBody;
+  /**
+   * A handful of keyframes, injected once. Inline styles can't express
+   * animation, and a stylesheet scoped to our own ids can't leak into the
+   * host page's CSS.
+   */
+  function injectStyles() {
+    if (document.getElementById("oasis-widget-styles")) return;
+    var style = document.createElement("style");
+    style.id = "oasis-widget-styles";
+    style.textContent =
+      "@keyframes oasis-pop{0%{transform:scale(0);opacity:0}60%{transform:scale(1.12)}100%{transform:scale(1);opacity:1}}" +
+      "@keyframes oasis-ring{0%{transform:scale(1);opacity:.55}100%{transform:scale(1.9);opacity:0}}" +
+      "@keyframes oasis-slide{0%{transform:translateY(10px);opacity:0}100%{transform:translateY(0);opacity:1}}" +
+      "#oasis-bubble{animation:oasis-pop 420ms cubic-bezier(.2,.9,.3,1.2) both}" +
+      "#oasis-teaser{animation:oasis-slide 300ms ease both}" +
+      ".oasis-ring{position:absolute;inset:0;border-radius:50%;background:" + BRAND + ";" +
+      "animation:oasis-ring 1800ms ease-out 3;pointer-events:none}" +
+      // Anyone who has asked their system to calm down gets a still widget.
+      "@media (prefers-reduced-motion:reduce){#oasis-bubble,#oasis-teaser,.oasis-ring" +
+      "{animation:none!important}}";
+    document.head.appendChild(style);
+  }
 
-  function buildUI() {
-    var bubble = document.createElement("button");
-    bubble.id = "oasis-bubble";
-    bubble.setAttribute("aria-label", "Open chat");
-    bubble.textContent = "💬";
-    bubble.style.cssText =
-      "position:fixed;bottom:20px;right:20px;width:56px;height:56px;border-radius:50%;" +
-      "background:#0e7c66;color:#fff;border:none;font-size:23px;cursor:pointer;z-index:99999;" +
-      "box-shadow:0 6px 20px rgba(11,43,39,0.28);transition:transform 140ms ease;";
-    bubble.onmouseenter = function () { bubble.style.transform = "scale(1.06)"; };
-    bubble.onmouseleave = function () { bubble.style.transform = "scale(1)"; };
+  var panel, bubble, badge, messageList, input, sendBtn, teaser;
+  var homeScreen, formScreen, chatScreen, tabBar, homeTab, chatTab;
+  var introRendered = false;
 
-    panel = document.createElement("div");
-    panel.id = "oasis-panel";
-    panel.style.cssText =
-      "position:fixed;bottom:88px;right:20px;width:336px;height:440px;background:#fff;" +
-      "border-radius:14px;box-shadow:0 12px 40px rgba(11,43,39,0.22);display:none;flex-direction:column;" +
-      "z-index:99999;overflow:hidden;border:1px solid #dce5e2;" +
-      "font-family:Inter,'Segoe UI',system-ui,sans-serif;font-size:14px;color:#10201e;";
+  function paintBadge() {
+    badge.textContent = unreadCount > 9 ? "9+" : String(unreadCount);
+    badge.style.display = unreadCount > 0 ? "flex" : "none";
+  }
 
-    // ---- Pre-chat form: name + mobile number, both mandatory. Chat body
-    // stays hidden until this is submitted (or was already submitted on a
-    // previous visit, per visitorDetails loaded from localStorage). ----
-    preChatForm = document.createElement("div");
-    preChatForm.id = "oasis-prechat";
-    preChatForm.style.cssText = "flex:1;display:flex;flex-direction:column;padding:16px;gap:10px;";
+  /** Only one screen shows at a time; the tab bar hides on the form. */
+  function showScreen(name) {
+    homeScreen.style.display = name === "home" ? "flex" : "none";
+    formScreen.style.display = name === "form" ? "flex" : "none";
+    chatScreen.style.display = name === "chat" ? "flex" : "none";
+    tabBar.style.display = name === "form" ? "none" : "flex";
 
-    var formTitle = document.createElement("div");
-    formTitle.textContent = "Start a conversation";
-    formTitle.style.cssText =
-      "font-size:16px;font-weight:600;color:#10201e;letter-spacing:-0.01em;margin-bottom:2px;";
+    homeTab.style.color = name === "home" ? INK : MUTED;
+    chatTab.style.color = name === "chat" ? INK : MUTED;
 
-    var formLede = document.createElement("div");
-    formLede.textContent = "Tell us who you are and we'll reply here.";
-    formLede.style.cssText = "font-size:13px;color:#5d716d;margin-bottom:6px;";
+    if (name === "chat") {
+      renderIntro();
+      loadHistory();
+      markRead();
+      setTimeout(function () { input.focus(); }, 50);
+    }
+  }
 
-    var nameInput = document.createElement("input");
+  /** Where a visitor lands: greeting, who they'll talk to, one button. */
+  function buildHomeScreen() {
+    homeScreen = el("div", "flex:1;display:none;flex-direction:column;overflow-y:auto;");
+
+    var header = el(
+      "div",
+      "padding:26px 22px 32px;background:linear-gradient(160deg," + BRAND_DARK + " 0%," + BRAND + " 100%);"
+    );
+
+    var mark = el(
+      "div",
+      "width:42px;height:42px;border-radius:12px;background:rgba(255,255,255,0.16);" +
+        "display:flex;align-items:center;justify-content:center;margin-bottom:18px;"
+    );
+    mark.innerHTML =
+      '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">' +
+      '<path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" ' +
+      'stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+    header.appendChild(mark);
+
+    header.appendChild(el("div", "font-size:26px;font-weight:700;color:#fff;line-height:1.25;", TITLE));
+    header.appendChild(
+      el("div", "font-size:26px;font-weight:700;color:rgba(255,255,255,0.7);line-height:1.25;", SUBTITLE)
+    );
+    homeScreen.appendChild(header);
+
+    // Agent card, pulled up over the gradient so the two read as one unit.
+    var card = el(
+      "div",
+      "margin:-18px 16px 0;background:#fff;border-radius:14px;padding:16px;" +
+        "box-shadow:0 6px 20px rgba(11,43,39,0.12);border:1px solid " + LINE + ";"
+    );
+
+    var who = el("div", "display:flex;align-items:center;gap:11px;margin-bottom:14px;");
+    who.appendChild(avatar(38));
+    var whoText = el("div", "min-width:0;");
+    whoText.appendChild(el("div", "font-size:14px;font-weight:600;color:" + INK + ";", AGENT_NAME));
+    whoText.appendChild(el("div", "font-size:12.5px;color:" + MUTED + ";", "Usually replies in a few minutes"));
+    who.appendChild(whoText);
+    card.appendChild(who);
+
+    var startBtn = el(
+      "button",
+      "width:100%;background:" + BRAND + ";color:#fff;border:none;border-radius:10px;" +
+        "padding:13px;font-size:15px;font-weight:600;font-family:inherit;cursor:pointer;" +
+        "display:flex;align-items:center;justify-content:center;gap:8px;"
+    );
+    startBtn.appendChild(el("span", "", conversationId ? "Continue chat" : "Let's chat"));
+    startBtn.insertAdjacentHTML(
+      "beforeend",
+      '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">' +
+      '<path d="M5 12h14M13 6l6 6-6 6" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+    );
+    startBtn.addEventListener("click", function () {
+      showScreen(visitorDetails ? "chat" : "form");
+    });
+    card.appendChild(startBtn);
+    homeScreen.appendChild(card);
+
+    if (TOPICS.length) {
+      var topicWrap = el("div", "padding:22px 16px 18px;");
+      topicWrap.appendChild(
+        el("div", "font-size:12.5px;color:" + MUTED + ";margin-bottom:10px;", "Common questions")
+      );
+      TOPICS.forEach(function (topic) {
+        var chip = el(
+          "button",
+          "display:block;width:100%;text-align:left;background:" + CANVAS + ";border:1px solid " + LINE + ";" +
+            "border-radius:10px;padding:11px 13px;margin-bottom:8px;font-size:13.5px;" +
+            "font-family:inherit;color:" + INK + ";cursor:pointer;",
+          topic
+        );
+        chip.addEventListener("mouseenter", function () { chip.style.borderColor = BRAND; });
+        chip.addEventListener("mouseleave", function () { chip.style.borderColor = LINE; });
+        // A topic is just a first message the visitor didn't have to type.
+        chip.addEventListener("click", function () {
+          pendingTopic = topic;
+          showScreen(visitorDetails ? "chat" : "form");
+          if (visitorDetails) {
+            input.value = pendingTopic;
+            pendingTopic = null;
+            handleSend();
+          }
+        });
+        topicWrap.appendChild(chip);
+      });
+      homeScreen.appendChild(topicWrap);
+    }
+  }
+
+  /** Name + mobile, both required, asked once per visitor. */
+  function buildFormScreen() {
+    formScreen = el("div", "flex:1;display:none;flex-direction:column;overflow-y:auto;");
+
+    var head = el(
+      "div",
+      "padding:16px 18px 14px;border-bottom:1px solid " + LINE + ";display:flex;align-items:center;gap:10px;"
+    );
+    var back = el(
+      "button",
+      "width:30px;height:30px;border-radius:50%;border:1px solid " + LINE + ";background:#fff;" +
+        "cursor:pointer;font-size:17px;line-height:1;color:" + MUTED + ";flex-shrink:0;padding:0;",
+      "‹"
+    );
+    back.setAttribute("aria-label", "Back");
+    back.addEventListener("click", function () { showScreen("home"); });
+    head.appendChild(back);
+    head.appendChild(el("div", "font-size:15px;font-weight:600;", "Before we start"));
+    formScreen.appendChild(head);
+
+    var body = el("div", "padding:18px 20px;");
+    body.appendChild(
+      el("div", "font-size:13.5px;color:" + MUTED + ";margin-bottom:18px;line-height:1.5;",
+        "So we can reply even if you leave this page, please share your name and mobile number.")
+    );
+
+    function labelFor(text) {
+      var l = el("label", "display:block;font-size:13px;font-weight:600;color:" + INK + ";margin-bottom:6px;");
+      l.appendChild(document.createTextNode(text));
+      l.appendChild(el("span", "color:#dc2626;margin-left:3px;", "*"));
+      return l;
+    }
+
+    body.appendChild(labelFor("Name"));
+    var nameInput = el(
+      "input",
+      "width:100%;box-sizing:border-box;border:1px solid " + LINE + ";border-radius:9px;" +
+        "padding:11px 12px;font-size:14px;font-family:inherit;color:" + INK + ";outline:none;"
+    );
     nameInput.type = "text";
-    nameInput.placeholder = "Your name";
-    nameInput.required = true;
-    nameInput.style.cssText =
-      "border:1px solid #dce5e2;border-radius:6px;padding:10px;font-size:14px;font-family:inherit;color:#10201e;";
+    nameInput.placeholder = "Your full name";
+    body.appendChild(nameInput);
+    var nameError = el("div", "font-size:12px;color:#dc2626;min-height:17px;margin:4px 0 8px;");
+    body.appendChild(nameError);
 
-    // Country picker + number, side by side. The visitor's country is
-    // guessed up front, so most people only type their local number —
-    // exactly what they'd write on paper.
-    var phoneRow = document.createElement("div");
-    phoneRow.style.cssText = "display:flex;gap:6px;";
-
-    var countrySelect = document.createElement("select");
+    body.appendChild(labelFor("Mobile number"));
+    var phoneRow = el("div", "display:flex;gap:7px;");
+    var countrySelect = el(
+      "select",
+      "border:1px solid " + LINE + ";border-radius:9px;padding:11px 6px;font-size:14px;" +
+        "font-family:inherit;color:" + INK + ";background:#fff;max-width:122px;flex-shrink:0;outline:none;"
+    );
     countrySelect.setAttribute("aria-label", "Country code");
-    countrySelect.style.cssText =
-      "border:1px solid #dce5e2;border-radius:6px;padding:10px 6px;font-size:14px;" +
-      "font-family:inherit;color:#10201e;background:#fff;max-width:118px;flex-shrink:0;";
-
     var detectedIso = detectCountry();
     COUNTRIES.forEach(function (c) {
       var option = document.createElement("option");
       option.value = c.iso;
-      // Name in the open list, dial code is what matters once collapsed.
       option.textContent = c.name + " +" + c.dial;
       if (c.iso === detectedIso) option.selected = true;
       countrySelect.appendChild(option);
     });
 
-    var phoneInput = document.createElement("input");
+    var phoneInput = el(
+      "input",
+      "flex:1;min-width:0;border:1px solid " + LINE + ";border-radius:9px;padding:11px 12px;" +
+        "font-size:14px;font-family:inherit;color:" + INK + ";outline:none;"
+    );
     phoneInput.type = "tel";
-    phoneInput.placeholder = "Mobile number";
-    phoneInput.required = true;
-    phoneInput.style.cssText =
-      "flex:1;min-width:0;border:1px solid #dce5e2;border-radius:6px;padding:10px;" +
-      "font-size:14px;font-family:inherit;color:#10201e;";
+    phoneInput.placeholder = "98765 43210";
+    phoneInput.setAttribute("inputmode", "tel");
+    phoneInput.setAttribute("maxlength", "20");
 
     phoneRow.appendChild(countrySelect);
     phoneRow.appendChild(phoneInput);
+    body.appendChild(phoneRow);
+    var phoneError = el("div", "font-size:12px;color:#dc2626;min-height:17px;margin:4px 0 10px;");
+    body.appendChild(phoneError);
+
+    var submit = el(
+      "button",
+      "width:100%;background:" + BRAND + ";color:#fff;border:none;border-radius:10px;padding:13px;" +
+        "font-size:15px;font-weight:600;font-family:inherit;cursor:pointer;",
+      "Start the chat"
+    );
+    body.appendChild(submit);
+    body.appendChild(
+      el("div", "font-size:11.5px;color:" + MUTED + ";margin-top:12px;text-align:center;line-height:1.5;",
+        "We use this only to continue this conversation.")
+    );
+    formScreen.appendChild(body);
 
     function selectedDialCode() {
       var country = findCountry(countrySelect.value);
       return country ? country.dial : "";
     }
 
-    var formError = document.createElement("div");
-    formError.style.cssText = "color:#a32b2b;font-size:12.5px;min-height:15px;";
-
-    var startBtn = document.createElement("button");
-    startBtn.textContent = "Start chat";
-    startBtn.style.cssText =
-      "margin-top:4px;background:#0e7c66;color:#fff;border:none;border-radius:6px;padding:11px;" +
-      "font-size:14.5px;font-family:inherit;cursor:pointer;";
-
-    preChatForm.appendChild(formTitle);
-    preChatForm.appendChild(formLede);
-    preChatForm.appendChild(nameInput);
-    preChatForm.appendChild(phoneRow);
-    preChatForm.appendChild(formError);
-    preChatForm.appendChild(startBtn);
-
     // Mirrors the server-side rule in backend/app/shared/phone.py. The
     // point of checking here is to tell the person what's wrong while
     // they're still looking at the field — the server check is what
     // actually protects the data.
     function phoneProblem(nationalNumber) {
-      if (!nationalNumber) return "Enter your mobile number.";
+      if (!nationalNumber) return "Please fill in this field.";
       if (!/^[0-9()\-.\s]+$/.test(nationalNumber)) {
-        return "A mobile number can only contain digits, spaces, and - ( ) .";
+        return "Digits only, please.";
       }
       var digits = nationalNumber.replace(/\D/g, "");
-      // Length is checked without the country code, since that part is
-      // chosen from the list and can't be wrong.
       if (digits.length < 6) return "That number is too short.";
       if (digits.length > 13) return "That number is too long.";
       if (/^(\d)\1+$/.test(digits)) return "Enter a real mobile number.";
       return null;
     }
 
-    function submitPreChatForm() {
+    function submitForm() {
       var name = nameInput.value.trim();
       var phone = phoneInput.value.trim();
+      nameError.textContent = "";
+      phoneError.textContent = "";
+
       if (name.length < 2) {
-        formError.textContent = "Enter your name.";
+        nameError.textContent = "Please fill in this field.";
+        nameInput.style.borderColor = "#dc2626";
         nameInput.focus();
         return;
       }
       var problem = phoneProblem(phone);
       if (problem) {
-        formError.textContent = problem;
+        phoneError.textContent = problem;
+        phoneInput.style.borderColor = "#dc2626";
         phoneInput.focus();
         return;
       }
@@ -451,159 +712,400 @@
       window.localStorage.setItem(COUNTRY_STORAGE_KEY, countrySelect.value);
       visitorDetails = { name: name, phone: fullPhone };
       saveDetails(visitorDetails);
-      showChatBody();
       identify();
+      showScreen("chat");
+
+      // A topic tapped on the home screen becomes the first message once
+      // the form is out of the way.
+      if (pendingTopic) {
+        input.value = pendingTopic;
+        pendingTopic = null;
+        handleSend();
+      }
     }
 
-    phoneInput.setAttribute("inputmode", "tel");
-    phoneInput.setAttribute("maxlength", "20");
+    submit.addEventListener("click", submitForm);
+    nameInput.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") phoneInput.focus();
+    });
+    phoneInput.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") submitForm();
+    });
+    nameInput.addEventListener("input", function () {
+      nameInput.style.borderColor = LINE;
+      nameError.textContent = "";
+    });
     phoneInput.addEventListener("input", function () {
       // Strip anything that could never belong in a phone number as it is
       // typed, so pasted junk is visibly rejected instead of silently sent.
       var cleaned = phoneInput.value.replace(/[^0-9()\-.\s]/g, "");
       if (cleaned !== phoneInput.value) {
         phoneInput.value = cleaned;
-        formError.textContent = "Only digits are allowed in a mobile number.";
-      } else if (formError.textContent) {
-        formError.textContent = "";
+        phoneError.textContent = "Digits only, please.";
+      } else {
+        phoneInput.style.borderColor = LINE;
+        phoneError.textContent = "";
       }
-    });
-    nameInput.addEventListener("input", function () {
-      if (formError.textContent) formError.textContent = "";
-    });
-
-    startBtn.addEventListener("click", submitPreChatForm);
-    nameInput.addEventListener("keydown", function (e) {
-      if (e.key === "Enter") phoneInput.focus();
-    });
-    phoneInput.addEventListener("keydown", function (e) {
-      if (e.key === "Enter") submitPreChatForm();
     });
     countrySelect.addEventListener("change", function () {
-      if (formError.textContent) formError.textContent = "";
+      phoneError.textContent = "";
       phoneInput.focus();
     });
+  }
 
-    // ---- Chat body: message list + input, shown only after the form ----
-    chatBody = document.createElement("div");
-    chatBody.style.cssText = "flex:1;display:none;flex-direction:column;overflow:hidden;";
+  function buildChatScreen() {
+    chatScreen = el("div", "flex:1;display:none;flex-direction:column;overflow:hidden;");
 
-    messageList = document.createElement("div");
+    var head = el(
+      "div",
+      "padding:12px 14px;border-bottom:1px solid " + LINE + ";display:flex;align-items:center;gap:11px;background:#fff;"
+    );
+    head.appendChild(avatar(34));
+    var headText = el("div", "min-width:0;flex:1;");
+    headText.appendChild(el("div", "font-size:14px;font-weight:600;", AGENT_NAME));
+    headText.appendChild(el("div", "font-size:12px;color:#16a34a;", "Online"));
+    head.appendChild(headText);
+
+    var minimize = el(
+      "button",
+      "border:none;background:transparent;cursor:pointer;color:" + MUTED +
+        ";font-size:22px;line-height:1;padding:2px 6px;font-family:inherit;",
+      "−"
+    );
+    minimize.setAttribute("aria-label", "Minimise chat");
+    minimize.addEventListener("click", function () { panel.style.display = "none"; });
+    head.appendChild(minimize);
+    chatScreen.appendChild(head);
+
+    messageList = el("div", "flex:1;overflow-y:auto;padding:16px;background:" + CANVAS + ";");
     messageList.id = "oasis-messages";
-    messageList.style.cssText = "flex:1;overflow-y:auto;padding:14px;background:#f4f8f6;";
+    chatScreen.appendChild(messageList);
 
-    var inputRow = document.createElement("div");
-    inputRow.style.cssText = "display:flex;border-top:1px solid #dce5e2;padding:10px;background:#fff;";
-
-    input = document.createElement("input");
+    var composer = el(
+      "div",
+      "display:flex;align-items:center;gap:9px;padding:11px 12px;border-top:1px solid " + LINE + ";background:#fff;"
+    );
+    input = el(
+      "input",
+      "flex:1;min-width:0;border:1px solid " + LINE + ";border-radius:22px;padding:11px 15px;" +
+        "font-size:14px;font-family:inherit;color:" + INK + ";outline:none;"
+    );
     input.type = "text";
-    input.placeholder = "Type a message...";
-    input.style.cssText =
-      "flex:1;border:1px solid #dce5e2;border-radius:6px;padding:9px 11px;font-size:14px;font-family:inherit;color:#10201e;";
-
-    var sendBtn = document.createElement("button");
-    sendBtn.textContent = "Send";
-    sendBtn.style.cssText =
-      "margin-left:8px;background:#0e7c66;color:#fff;border:none;border-radius:6px;padding:9px 14px;" +
-      "font-size:14px;font-family:inherit;cursor:pointer;";
-
-    inputRow.appendChild(input);
-    inputRow.appendChild(sendBtn);
-    chatBody.appendChild(messageList);
-    chatBody.appendChild(inputRow);
-    panel.appendChild(preChatForm);
-    panel.appendChild(chatBody);
-
-    document.body.appendChild(bubble);
-    document.body.appendChild(panel);
-
-    function showChatBody() {
-      preChatForm.style.display = "none";
-      chatBody.style.display = "flex";
-      input.focus();
-      loadHistory();
-    }
-
-    // If we already know this visitor (returning visit), skip the form.
-    if (visitorDetails) {
-      preChatForm.style.display = "none";
-      chatBody.style.display = "flex";
-    }
-
-    bubble.addEventListener("click", function () {
-      var isOpen = panel.style.display === "flex";
-      panel.style.display = isOpen ? "none" : "flex";
-      if (!isOpen && visitorDetails) {
-        identify();
-        loadHistory();
-        input.focus();
-      }
-    });
-
-    function handleSend() {
-      var text = input.value.trim();
-      if (!text) return;
-      input.value = "";
-      var row = renderMessage("customer", text);
-      setPending(row, true);
-
-      var request = conversationId
-        ? sendMessage(text).then(function () {
-            return null;
-          })
-        : startConversation(text).then(function (data) {
-            conversationId = data.id;
-            historyLoaded = true;
-            saveConversationId(conversationId);
-            connectSocket();
-            return null;
-          });
-
-      request
-        .then(function () {
-          setPending(row, false);
-        })
-        .catch(function () {
-          // The message never left the browser — say so instead of showing
-          // it as delivered and letting the visitor wait for a reply that
-          // can never come.
-          setFailed(row, text);
-        });
-    }
-
-    sendBtn.addEventListener("click", handleSend);
+    input.placeholder = "Write a message…";
+    input.addEventListener("focus", function () { input.style.borderColor = BRAND; });
+    input.addEventListener("blur", function () { input.style.borderColor = LINE; });
     input.addEventListener("keydown", function (e) {
       if (e.key === "Enter") handleSend();
     });
 
-    // If the visitor already had an open thread, restore it right away so
-    // the unread agent replies are there when they open the bubble.
-    if (visitorDetails && conversationId) {
-      loadHistory();
-    }
+    sendBtn = el(
+      "button",
+      "width:40px;height:40px;border-radius:50%;background:" + BRAND + ";border:none;cursor:pointer;" +
+        "display:flex;align-items:center;justify-content:center;flex-shrink:0;padding:0;"
+    );
+    sendBtn.setAttribute("aria-label", "Send message");
+    sendBtn.innerHTML =
+      '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">' +
+      '<path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+    sendBtn.addEventListener("click", handleSend);
+
+    composer.appendChild(input);
+    composer.appendChild(sendBtn);
+    chatScreen.appendChild(composer);
   }
 
-  function renderMessage(senderType, content) {
-    var row = document.createElement("div");
-    row.className = "oasis-message oasis-message--" + senderType;
-    row.textContent = content;
-    row.style.cssText =
-      "margin:6px 0;padding:9px 12px;border-radius:12px;max-width:80%;font-size:14px;" +
-      "line-height:1.45;white-space:pre-wrap;word-break:break-word;" +
-      (senderType === "customer"
-        ? "background:#0e7c66;color:#fff;margin-left:auto;border-bottom-right-radius:3px;"
-        : "background:#fff;color:#10201e;border:1px solid #dce5e2;border-bottom-left-radius:3px;");
+  function buildTabBar() {
+    tabBar = el(
+      "div",
+      "display:none;border-top:1px solid " + LINE + ";background:#fff;padding:6px 8px 8px;"
+    );
+    var inner = el("div", "display:flex;width:100%;");
+
+    function tab(label, icon, onClick) {
+      var t = el(
+        "button",
+        "flex:1;background:transparent;border:none;cursor:pointer;font-family:inherit;" +
+          "font-size:11.5px;color:" + MUTED + ";display:flex;flex-direction:column;" +
+          "align-items:center;gap:3px;padding:6px 0;"
+      );
+      t.innerHTML = icon;
+      t.appendChild(el("span", "", label));
+      t.addEventListener("click", onClick);
+      return t;
+    }
+
+    homeTab = tab(
+      "Home",
+      '<svg width="19" height="19" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">' +
+      '<path d="M3 10.5L12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1v-9.5z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>',
+      function () { showScreen("home"); }
+    );
+    chatTab = tab(
+      "Chat",
+      '<svg width="19" height="19" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">' +
+      '<path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 1 1 17 0z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>',
+      function () { showScreen(visitorDetails ? "chat" : "form"); }
+    );
+
+    inner.appendChild(homeTab);
+    inner.appendChild(chatTab);
+    tabBar.appendChild(inner);
+  }
+
+  var TEASER_SEEN_KEY = "oasis_teaser_seen_" + ORG_SLUG;
+
+  /**
+   * The small "Hi there! Need any help?" card that slides in above the
+   * launcher after a few seconds.
+   *
+   * Rules that keep it an invitation rather than a nuisance:
+   *  - once per browser session, remembered even across page navigations
+   *  - never for someone who already has a chat open with us
+   *  - dismissable, and dismissing counts as seen
+   */
+  function showTeaser() {
+    if (TEASER_OFF || conversationId || teaser) return;
+    if (panel.style.display === "flex") return;
+    try {
+      if (window.sessionStorage.getItem(TEASER_SEEN_KEY)) return;
+    } catch (e) { /* private mode — just show it */ }
+
+    teaser = el(
+      "div",
+      "position:fixed;bottom:92px;right:20px;max-width:270px;background:#fff;" +
+        "border:1px solid " + LINE + ";border-radius:14px;padding:13px 14px;" +
+        "box-shadow:0 12px 32px rgba(11,43,39,0.18);z-index:99998;display:flex;gap:10px;" +
+        "align-items:flex-start;cursor:pointer;" +
+        "font-family:Inter,'Segoe UI',system-ui,sans-serif;"
+    );
+    teaser.id = "oasis-teaser";
+
+    teaser.appendChild(avatar(32));
+
+    var body = el("div", "min-width:0;flex:1;");
+    body.appendChild(el("div", "font-size:12.5px;font-weight:600;color:" + INK + ";", AGENT_NAME));
+    body.appendChild(
+      el("div", "font-size:13px;color:" + MUTED + ";line-height:1.45;margin-top:2px;", TEASER_TEXT)
+    );
+    teaser.appendChild(body);
+
+    var close = el(
+      "button",
+      "border:none;background:transparent;color:" + MUTED + ";font-size:16px;line-height:1;" +
+        "cursor:pointer;padding:0 2px;flex-shrink:0;font-family:inherit;",
+      "×"
+    );
+    close.setAttribute("aria-label", "Dismiss");
+    close.addEventListener("click", function (e) {
+      e.stopPropagation();
+      dismissTeaser();
+    });
+    teaser.appendChild(close);
+
+    teaser.addEventListener("click", function () {
+      dismissTeaser();
+      window.OasisChatbot.open();
+    });
+
+    document.body.appendChild(teaser);
+  }
+
+  function dismissTeaser() {
+    try {
+      window.sessionStorage.setItem(TEASER_SEEN_KEY, "1");
+    } catch (e) { /* nothing to remember it with — fine */ }
+    if (teaser && teaser.parentNode) teaser.parentNode.removeChild(teaser);
+    teaser = null;
+  }
+
+  function buildUI() {
+    injectStyles();
+
+    // ----- Launcher -----
+    // A pill when the site gives it words, a circle otherwise. Words get
+    // noticed more, but they also take more room, so it stays opt-in.
+    var isPill = !!LAUNCHER_TEXT;
+    bubble = el(
+      "button",
+      "position:fixed;bottom:20px;right:20px;" +
+        (isPill
+          ? "height:54px;border-radius:27px;padding:0 20px 0 16px;gap:10px;"
+          : "width:60px;height:60px;border-radius:50%;padding:0;") +
+        "background:" + BRAND + ";border:none;cursor:pointer;z-index:99999;" +
+        "box-shadow:0 10px 28px rgba(11,43,39,0.34);display:flex;align-items:center;" +
+        "justify-content:center;transition:transform 160ms ease,box-shadow 160ms ease;" +
+        "font-family:Inter,'Segoe UI',system-ui,sans-serif;"
+    );
+    bubble.id = "oasis-bubble";
+    bubble.setAttribute("aria-label", "Open chat");
+
+    // A human face pulls more attention than a generic speech bubble, so
+    // an agent photo is used as the launcher when the site provides one.
+    if (AGENT_AVATAR) {
+      var face = el(
+        "img",
+        "width:" + (isPill ? 36 : 40) + "px;height:" + (isPill ? 36 : 40) +
+          "px;border-radius:50%;object-fit:cover;border:2px solid rgba(255,255,255,0.85);"
+      );
+      face.src = AGENT_AVATAR;
+      face.alt = "";
+      bubble.appendChild(face);
+    } else {
+      bubble.insertAdjacentHTML(
+        "beforeend",
+        '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">' +
+        '<path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" ' +
+        'stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+      );
+    }
+
+    if (isPill) {
+      bubble.appendChild(
+        el("span", "color:#fff;font-size:15px;font-weight:600;white-space:nowrap;", LAUNCHER_TEXT)
+      );
+    }
+
+    // Two expanding rings, three times, then silence. A widget that pulses
+    // forever stops being an invitation and becomes something to ignore.
+    var ring = el("span", "");
+    ring.className = "oasis-ring";
+    ring.style.zIndex = "-1";
+    bubble.appendChild(ring);
+    setTimeout(function () {
+      if (ring.parentNode) ring.parentNode.removeChild(ring);
+    }, 6000);
+
+    bubble.onmouseenter = function () {
+      bubble.style.transform = "scale(1.06)";
+      bubble.style.boxShadow = "0 14px 34px rgba(11,43,39,0.42)";
+    };
+    bubble.onmouseleave = function () {
+      bubble.style.transform = "scale(1)";
+      bubble.style.boxShadow = "0 10px 28px rgba(11,43,39,0.34)";
+    };
+
+    badge = el(
+      "span",
+      "position:absolute;top:-2px;right:-2px;min-width:20px;height:20px;border-radius:10px;" +
+        "background:#e11d48;color:#fff;font-size:11px;font-weight:600;display:none;" +
+        "align-items:center;justify-content:center;padding:0 5px;border:2px solid #fff;box-sizing:border-box;"
+    );
+    bubble.appendChild(badge);
+
+    // ----- Panel -----
+    panel = el(
+      "div",
+      "position:fixed;bottom:88px;right:20px;width:372px;max-width:calc(100vw - 32px);" +
+        "height:580px;max-height:calc(100vh - 120px);background:#fff;border-radius:16px;" +
+        "box-shadow:0 20px 60px rgba(11,43,39,0.28);display:none;flex-direction:column;" +
+        "z-index:99999;overflow:hidden;border:1px solid " + LINE + ";" +
+        "font-family:Inter,'Segoe UI',system-ui,-apple-system,sans-serif;font-size:14px;color:" + INK + ";"
+    );
+    panel.id = "oasis-panel";
+
+    buildHomeScreen();
+    buildFormScreen();
+    buildChatScreen();
+    buildTabBar();
+
+    panel.appendChild(homeScreen);
+    panel.appendChild(formScreen);
+    panel.appendChild(chatScreen);
+    panel.appendChild(tabBar);
+
+    document.body.appendChild(bubble);
+    document.body.appendChild(panel);
+
+    bubble.addEventListener("click", function () {
+      var isOpen = panel.style.display === "flex";
+      panel.style.display = isOpen ? "none" : "flex";
+      dismissTeaser();
+      if (isOpen) return;
+
+      unreadCount = 0;
+      paintBadge();
+      // A returning visitor with a live thread should land in it, not on a
+      // welcome screen they've already read.
+      showScreen(visitorDetails && conversationId ? "chat" : "home");
+      if (visitorDetails) identify();
+    });
+
+    // Pull unread replies in even before the visitor opens the panel.
+    if (visitorDetails && conversationId) loadHistory();
+
+    // Long enough that the visitor has looked at the page first, short
+    // enough to catch them before they leave.
+    if (!TEASER_OFF) setTimeout(showTeaser, TEASER_DELAY);
+  }
+
+  // ---------- Rendering ----------
+
+  /** The agent's opening line, shown once above whatever follows. */
+  function renderIntro() {
+    if (introRendered) return;
+    introRendered = true;
+    renderMessage("agent", GREETING, null, true);
+  }
+
+  function renderMessage(senderType, content, createdAt, skipScroll) {
+    var mine = senderType === "customer";
+    var row = el("div", "display:flex;gap:8px;margin-bottom:12px;" + (mine ? "justify-content:flex-end;" : ""));
+
+    if (!mine) row.appendChild(avatar(26));
+
+    var stack = el(
+      "div",
+      "max-width:78%;display:flex;flex-direction:column;" + (mine ? "align-items:flex-end;" : "")
+    );
+    var bubbleEl = el(
+      "div",
+      "padding:10px 13px;border-radius:14px;font-size:14px;line-height:1.45;white-space:pre-wrap;" +
+        "word-break:break-word;" +
+        (mine
+          ? "background:" + BRAND + ";color:#fff;border-bottom-right-radius:4px;"
+          : "background:#fff;color:" + INK + ";border:1px solid " + LINE + ";border-bottom-left-radius:4px;"),
+      content
+    );
+    stack.appendChild(bubbleEl);
+
+    var meta = el("div", "font-size:11px;color:" + MUTED + ";margin-top:4px;padding:0 3px;", clockTime(createdAt));
+    if (mine) {
+      // Only the newest outgoing message shows a receipt — the thread is
+      // read top to bottom, so repeating it on every bubble is noise.
+      var receipt = el("span", "margin-left:6px;", "Sent");
+      meta.appendChild(receipt);
+      row.dataset.sentAt = createdAt || new Date().toISOString();
+      row._receipt = receipt;
+      lastOutgoingRow = row;
+    }
+    stack.appendChild(meta);
+    row.appendChild(stack);
+
     messageList.appendChild(row);
-    messageList.scrollTop = messageList.scrollHeight;
+    if (mine) paintReceipt();
+    if (!skipScroll) messageList.scrollTop = messageList.scrollHeight;
     return row;
   }
 
+  /**
+   * Moves the last outgoing message between "Sent" and "Seen". Driven by
+   * one timestamp rather than per-message flags, so a receipt that arrives
+   * for an older message still lights up the right bubble.
+   */
+  function paintReceipt() {
+    if (!lastOutgoingRow || !lastOutgoingRow._receipt) return;
+    var sentAt = lastOutgoingRow.dataset.sentAt;
+    var seen =
+      agentReadAt && sentAt && new Date(agentReadAt).getTime() >= new Date(sentAt).getTime();
+    lastOutgoingRow._receipt.textContent = seen ? "Seen" : "Sent";
+    lastOutgoingRow._receipt.style.color = seen ? BRAND : MUTED;
+    lastOutgoingRow._receipt.style.fontWeight = seen ? "600" : "400";
+  }
+
   function renderNotice(text) {
-    var row = document.createElement("div");
-    row.textContent = text;
-    row.style.cssText =
-      "margin:6px 0;padding:6px 10px;font-size:12.5px;color:#5d716d;text-align:center;";
-    messageList.appendChild(row);
+    messageList.appendChild(
+      el("div", "text-align:center;font-size:12px;color:" + MUTED + ";margin:10px 0;padding:0 12px;", text)
+    );
     messageList.scrollTop = messageList.scrollHeight;
   }
 
@@ -613,8 +1115,12 @@
 
   function setFailed(row, text) {
     row.style.opacity = "1";
-    row.style.background = "#a32b2b";
-    row.style.border = "none";
+    var bubbleEl = row.querySelector("div > div");
+    if (bubbleEl) {
+      bubbleEl.style.background = "#a32b2b";
+      bubbleEl.style.border = "none";
+      bubbleEl.style.color = "#fff";
+    }
     row.title = "Not delivered — tap to retry";
     row.style.cursor = "pointer";
     row.onclick = function () {
@@ -625,19 +1131,49 @@
     renderNotice("Message not sent. Check your connection and tap the red message to retry.");
   }
 
+  function handleSend() {
+    var text = input.value.trim();
+    if (!text) return;
+    input.value = "";
+    var row = renderMessage("customer", text);
+    setPending(row, true);
+
+    var request = conversationId
+      ? sendMessage(text).then(function () { return null; })
+      : startConversation(text).then(function (data) {
+          conversationId = data.id;
+          historyLoaded = true;
+          saveConversationId(conversationId);
+          connectSocket();
+          return null;
+        });
+
+    request
+      .then(function () {
+        setPending(row, false);
+      })
+      .catch(function () {
+        // The message never left the browser — say so instead of showing
+        // it as delivered and letting the visitor wait for a reply that
+        // can never come.
+        setFailed(row, text);
+      });
+  }
+
   buildUI();
 
-  // Exposed for host pages that want programmatic control (rare, but the
-  // architecture doc calls for the widget to be scriptable, not just clickable).
+  // Exposed for host pages that want programmatic control.
   window.OasisChatbot = {
     open: function () {
       panel.style.display = "flex";
-      // Only identify() here if the pre-chat form is already satisfied —
-      // otherwise the visitor lands on the form, same as clicking the bubble.
-      if (visitorDetails) {
-        identify();
-        loadHistory();
-      }
+      dismissTeaser();
+      unreadCount = 0;
+      paintBadge();
+      showScreen(visitorDetails && conversationId ? "chat" : "home");
+      if (visitorDetails) identify();
+    },
+    close: function () {
+      panel.style.display = "none";
     },
     reset: function () {
       clearConversationId();
